@@ -1,0 +1,569 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-config
+data:
+  spark-defaults.conf: |
+    # Core settings
+    spark.master=spark://spark-master:7077
+    spark.driver.memory=24g
+    spark.executor.memory=24g
+    spark.executor.cores=8
+    spark.executor.instances=2
+    spark.executor.memoryOverhead=2g
+    spark.driver.maxResultSize=4g
+    spark.python.worker.memory=1g
+    
+    # Storage settings - using both NVMes for local storage
+    spark.local.dir=/spark/nvme1/tmp,/spark/nvme2/tmp
+    
+    # Log directory settings
+    spark.executor.logs.rolling.enabled=true
+    spark.executor.logs.rolling.maxRetainedFiles=5
+    spark.executor.logs.rolling.maxSize=100m
+    spark.executor.logs.rolling.strategy=size
+    spark.executor.logs.rolling.time.interval=daily
+    spark.worker.cleanup.enabled=true
+    spark.worker.cleanup.interval=30
+    spark.history.fs.logDirectory=/opt/spark/work-dir/logs
+    spark.eventLog.enabled=true
+    spark.eventLog.dir=/opt/spark/work-dir/logs
+    
+    # Executor log directory - CRITICAL for GC logs
+    spark.executor.extraJavaOptions=-XX:+UseG1GC -XX:+UnlockDiagnosticVMOptions -XX:+G1SummarizeConcMark -XX:InitiatingHeapOccupancyPercent=35 -XX:ConcGCThreads=12
+    spark.driver.extraJavaOptions=-XX:+UseG1GC -XX:+UnlockDiagnosticVMOptions -XX:+G1SummarizeConcMark -XX:InitiatingHeapOccupancyPercent=35 -XX:ConcGCThreads=12
+
+    # I/O optimization
+    spark.io.compression.codec=lz4
+    spark.io.compression.lz4.blockSize=512k
+    spark.file.transferTo=true
+    
+    # Memory tuning
+    spark.memory.fraction=0.8
+    spark.memory.storageFraction=0.3
+    
+    # Shuffle optimization
+    spark.shuffle.file.buffer=64k
+    spark.shuffle.compress=true
+    spark.shuffle.spill.compress=true
+    spark.shuffle.service.enabled=true
+    spark.shuffle.sort.bypassMergeThreshold=10000
+    
+    # Disk-related tuning
+    spark.disk.spillCompress=true
+    spark.rdd.compress=true
+    spark.serializer=org.apache.spark.serializer.KryoSerializer
+    spark.kryoserializer.buffer.max=1g
+    spark.kryoserializer.buffer=64m
+    
+    # Data locality preference - critical for NVMe performance
+    spark.locality.wait=100ms
+    spark.locality.wait.node=300ms
+    spark.locality.wait.process=1s
+    
+    # Network settings
+    spark.reducer.maxSizeInFlight=96m
+    spark.maxRemoteBlockSizeFetchToMem=200m
+    spark.network.timeout=600s
+    
+    # SQL optimization
+    spark.sql.files.maxPartitionBytes=134217728
+    spark.sql.files.openCostInBytes=4194304
+    spark.sql.shuffle.partitions=200
+    spark.sql.adaptive.enabled=true
+    spark.sql.adaptive.coalescePartitions.enabled=true
+    spark.sql.adaptive.skewJoin.enabled=true
+    
+    # Storage format options
+    spark.sql.parquet.compression.codec=snappy
+    spark.sql.parquet.mergeSchema=false
+    spark.sql.parquet.filterPushdown=true
+    spark.sql.hive.metastorePartitionPruning=true
+    
+    # Storage level for frequently used RDDs
+    spark.storage.level=MEMORY_AND_DISK_SER
+    
+    # Dynamic allocation
+    #spark.dynamicAllocation.enabled=false
+    #spark.dynamicAllocation.initialExecutors=2
+    #spark.dynamicAllocation.minExecutors=2
+    #spark.dynamicAllocation.maxExecutors=10
+    #spark.dynamicAllocation.executorIdleTimeout=60s
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-startup-script
+data:
+  start-master.sh: |
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-startup-script
+data:
+  start-master.sh: |
+    #!/bin/bash
+    # Simplified script based on known working command
+    
+    # Create required directories
+    mkdir -p /opt/spark/work-dir/logs
+    chmod 777 /opt/spark/work-dir/logs
+    
+    # Get the pod's IP address
+    POD_IP=$(hostname -i)
+    echo "Pod IP: $POD_IP"
+    
+    # Minimal environment variables - avoiding binding issues
+    export SPARK_LOCAL_IP="0.0.0.0"  # Critical: Bind to all interfaces
+    export SPARK_MASTER_HOST=$POD_IP
+    export SPARK_MASTER_PORT=7077
+    export SPARK_MASTER_WEBUI_PORT=8080
+    
+    echo "Starting Spark Master with minimal configuration"
+    
+    # Using the exact command that works when run directly
+    /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+
+  start-worker.sh: |
+    #!/bin/bash
+    # Script to start Spark worker with proper network binding for Kubernetes
+    
+    # Get the pod's IP address for binding
+    POD_IP=$(hostname -i)
+    echo "Pod IP: $POD_IP" 
+    
+    # Setup environment variables
+    export SPARK_LOCAL_IP=$POD_IP
+    export SPARK_WORKER_WEBUI_PORT=8081
+    export SPARK_LOG_DIR=/opt/spark/work-dir/logs
+    
+    # Create required directories
+    mkdir -p /spark/nvme1/tmp
+    mkdir -p /spark/nvme2/tmp
+    mkdir -p /opt/spark/work-dir/logs
+    chmod -R 777 /opt/spark/work-dir/logs
+    
+    echo "Starting Spark Worker with binding to $POD_IP"
+    
+    # Use spark-class directly instead of the script to stay in foreground
+    /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker \
+      spark://spark-master:7077 \
+      --host $POD_IP \
+      --webui-port 8081 \
+      --work-dir /opt/spark/work-dir
+  
+  init-nvme.sh: |
+    #!/bin/bash
+    # Enhanced script to initialize NVMe drives for Spark
+    # This addresses permission issues and sets up proper directory structure
+    echo "Initializing NVMe drives for Spark..."
+    
+    # Get the user ID that Spark will run as (typically 185 for the apache/spark image)
+    SPARK_UID=185
+    SPARK_GID=185
+    
+    # Create directories on NVMe1
+    mkdir -p /spark/nvme1/tmp
+    mkdir -p /spark/nvme1/data
+    mkdir -p /spark/nvme1/checkpoint
+    mkdir -p /spark/nvme1/upload
+    mkdir -p /spark/nvme1/blockmgr
+    
+    # Create directories on NVMe2
+    mkdir -p /spark/nvme2/tmp
+    mkdir -p /spark/nvme2/data
+    mkdir -p /spark/nvme2/checkpoint
+    mkdir -p /spark/nvme2/blockmgr
+    
+    # Create work-dir for logs
+    mkdir -p /opt/spark/work-dir/logs
+    mkdir -p /opt/spark/work-dir/data
+    
+    # Set very permissive permissions first to ensure access
+    chmod -R 777 /spark/nvme1
+    chmod -R 777 /spark/nvme2
+    chmod -R 777 /opt/spark/work-dir
+    
+    # Then set proper ownership
+    chown -R $SPARK_UID:$SPARK_GID /spark/nvme1
+    chown -R $SPARK_UID:$SPARK_GID /spark/nvme2
+    chown -R $SPARK_UID:$SPARK_GID /opt/spark/work-dir
+    
+    # Verify storage availability and write capabilities
+    echo "Testing write access to NVMe drives..."
+    su -c "touch /spark/nvme1/tmp/test_file" -s /bin/sh $SPARK_UID
+    su -c "touch /spark/nvme2/tmp/test_file" -s /bin/sh $SPARK_UID
+    su -c "touch /opt/spark/work-dir/logs/test_file" -s /bin/sh $SPARK_UID
+    
+    if [ -f "/spark/nvme1/tmp/test_file" ] && [ -f "/spark/nvme2/tmp/test_file" ] && [ -f "/opt/spark/work-dir/logs/test_file" ]; then
+        echo "NVMe drives and work-dir initialized successfully with correct permissions"
+        rm /spark/nvme1/tmp/test_file
+        rm /spark/nvme2/tmp/test_file
+        rm /opt/spark/work-dir/logs/test_file
+    else
+        echo "WARNING: Permission test failed! Spark may not have proper access to NVMe drives or work-dir"
+        # Try a more aggressive approach
+        chmod -R 777 /spark/nvme1
+        chmod -R 777 /spark/nvme2
+        chmod -R 777 /opt/spark/work-dir
+    fi
+    
+    # Check filesystem type and available space
+    df -Th | grep -E "/spark/nvme1|/spark/nvme2|/opt/spark/work-dir"
+    
+    echo "NVMe drive initialization complete"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-master
+spec:
+  selector:
+    app: spark-master
+  ports:
+  - port: 7077
+    name: spark
+  - port: 8080
+    name: webui
+  type: ClusterIP
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spark-master
+spec:
+  serviceName: "spark-master"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-master
+  template:
+    metadata:
+      labels:
+        app: spark-master
+    spec:
+      volumes:
+      - name: spark-conf
+        emptyDir: {}
+      - name: spark-config
+        configMap:
+          name: spark-config
+      - name: startup-script
+        configMap:
+          name: spark-startup-script
+          defaultMode: 0755
+      - name: work-dir
+        emptyDir: {}
+      initContainers:
+      - name: copy-config
+        image: busybox
+        command:
+        - sh
+        - -c
+        - cp /config/spark-defaults.conf /conf/
+        volumeMounts:
+        - name: spark-config
+          mountPath: /config
+        - name: spark-conf
+          mountPath: /conf
+      containers:
+      - name: spark-master
+        image: apache/spark:3.4.0
+        command: ["/bin/bash", "/scripts/start-master.sh"]
+        ports:
+        - containerPort: 7077
+          name: spark
+        - containerPort: 8080
+          name: webui
+        env:
+        - name: SPARK_MASTER_PORT
+          value: "7077"
+        - name: SPARK_MASTER_WEBUI_PORT
+          value: "8080"
+        - name: SPARK_LOG_DIR
+          value: "/opt/spark/work-dir/logs"
+        volumeMounts:
+        - name: spark-conf
+          mountPath: /opt/spark/conf
+        - name: startup-script
+          mountPath: /scripts
+        - name: work-dir
+          mountPath: /opt/spark/work-dir
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spark-worker-node01
+spec:
+  serviceName: "spark-worker-node01"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-worker
+      node: worker01
+  template:
+    metadata:
+      labels:
+        app: spark-worker
+        node: worker01
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - sparkbox-worker01
+      volumes:
+      - name: spark-conf
+        emptyDir: {}
+      - name: spark-config
+        configMap:
+          name: spark-config
+      - name: startup-script
+        configMap:
+          name: spark-startup-script
+          defaultMode: 0755
+      - name: nvme1
+        hostPath:
+          path: /mnt/nvme1
+          type: Directory
+      - name: nvme2
+        hostPath:
+          path: /mnt/nvme2
+          type: Directory
+      - name: work-dir
+        emptyDir: {}
+      securityContext:
+        fsGroup: 185  # Match Spark's group ID
+      initContainers:
+      - name: copy-config
+        image: busybox
+        command:
+        - sh
+        - -c
+        - cp /config/spark-defaults.conf /conf/
+        volumeMounts:
+        - name: spark-config
+          mountPath: /config
+        - name: spark-conf
+          mountPath: /conf
+      - name: init-nvme
+        image: busybox
+        securityContext:
+          privileged: true  # Needed for filesystem operations
+        command:
+        - /bin/sh
+        - /scripts/init-nvme.sh
+        volumeMounts:
+        - name: startup-script
+          mountPath: /scripts
+        - name: nvme1
+          mountPath: /spark/nvme1
+        - name: nvme2
+          mountPath: /spark/nvme2
+        - name: work-dir
+          mountPath: /opt/spark/work-dir
+      containers:
+      - name: spark-worker
+        image: apache/spark:3.4.0
+        securityContext:
+          runAsUser: 185  # Explicit UID for Spark user
+          runAsGroup: 185
+          allowPrivilegeEscalation: false
+        command: ["/scripts/start-worker.sh"]
+        env:
+        - name: SPARK_WORKER_CORES
+          value: "30"
+        - name: SPARK_WORKER_MEMORY
+          value: "192g"
+        - name: SPARK_LOCAL_DIRS
+          value: "/spark/nvme1/tmp,/spark/nvme2/tmp"
+        - name: SPARK_LOCAL_HOSTNAME
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: SPARK_PUBLIC_DNS
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: SPARK_LOG_LEVEL
+          value: "INFO"
+        - name: SPARK_LOG_DIR
+          value: "/opt/spark/work-dir/logs"
+        - name: SPARK_WORKER_WEBUI_PORT
+          value: "8081"
+        ports:
+        - containerPort: 8081
+          name: webui
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8081
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        volumeMounts:
+        - name: spark-conf
+          mountPath: /opt/spark/conf
+        - name: startup-script
+          mountPath: /scripts
+        - name: nvme1
+          mountPath: /spark/nvme1
+        - name: nvme2
+          mountPath: /spark/nvme2
+        - name: work-dir
+          mountPath: /opt/spark/work-dir
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spark-worker-node02
+spec:
+  serviceName: "spark-worker-node02"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-worker
+      node: worker02
+  template:
+    metadata:
+      labels:
+        app: spark-worker
+        node: worker02
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - sparkbox-worker02
+      volumes:
+      - name: spark-conf
+        emptyDir: {}
+      - name: spark-config
+        configMap:
+          name: spark-config
+      - name: startup-script
+        configMap:
+          name: spark-startup-script
+          defaultMode: 0755
+      - name: nvme1
+        hostPath:
+          path: /mnt/nvme1
+          type: Directory
+      - name: nvme2
+        hostPath:
+          path: /mnt/nvme2
+          type: Directory
+      - name: work-dir
+        emptyDir: {}
+      securityContext:
+        fsGroup: 185  # Match Spark's group ID
+      initContainers:
+      - name: copy-config
+        image: busybox
+        command:
+        - sh
+        - -c
+        - cp /config/spark-defaults.conf /conf/
+        volumeMounts:
+        - name: spark-config
+          mountPath: /config
+        - name: spark-conf
+          mountPath: /conf
+      - name: init-nvme
+        image: busybox
+        securityContext:
+          privileged: true  # Needed for filesystem operations
+        command:
+        - /bin/sh
+        - /scripts/init-nvme.sh
+        volumeMounts:
+        - name: startup-script
+          mountPath: /scripts
+        - name: nvme1
+          mountPath: /spark/nvme1
+        - name: nvme2
+          mountPath: /spark/nvme2
+        - name: work-dir
+          mountPath: /opt/spark/work-dir
+      containers:
+      - name: spark-worker
+        image: apache/spark:3.4.0
+        securityContext:
+          runAsUser: 185  # Explicit UID for Spark user
+          runAsGroup: 185
+          allowPrivilegeEscalation: false
+        command: ["/scripts/start-worker.sh"]
+        env:
+        - name: SPARK_WORKER_CORES
+          value: "30"
+        - name: SPARK_WORKER_MEMORY
+          value: "192g"
+        - name: SPARK_LOCAL_DIRS
+          value: "/spark/nvme1/tmp,/spark/nvme2/tmp"
+        - name: SPARK_LOCAL_HOSTNAME
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: SPARK_PUBLIC_DNS
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: SPARK_LOG_LEVEL
+          value: "INFO"
+        - name: SPARK_LOG_DIR
+          value: "/opt/spark/work-dir/logs"
+        - name: SPARK_WORKER_WEBUI_PORT
+          value: "8081"
+        ports:
+        - containerPort: 8081
+          name: webui
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8081
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        volumeMounts:
+        - name: spark-conf
+          mountPath: /opt/spark/conf
+        - name: startup-script
+          mountPath: /scripts
+        - name: nvme1
+          mountPath: /spark/nvme1
+        - name: nvme2
+          mountPath: /spark/nvme2
+        - name: work-dir
+          mountPath: /opt/spark/work-dir
